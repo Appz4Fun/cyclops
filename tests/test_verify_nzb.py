@@ -258,6 +258,22 @@ class TestVerifyNzbParsingAndConfig(unittest.TestCase):
         assert result.decoded_size == 11
         assert "crc32 mismatch" in result.error
 
+    def test_yenc_body_validator_rejects_bad_ypart_range(self):
+        import verify_nzb
+
+        body = [
+            b"=ybegin part=1 total=1 line=128 size=11 name=test.bin",
+            b"=ypart begin=5 end=20",
+            yenc_encode(b"hello world"),
+            b"=yend size=11 pcrc32=0d4a1185",
+        ]
+
+        result = verify_nzb.validate_yenc_body(body)
+
+        assert result.ok is False
+        assert result.decoded_size == 11
+        assert "ypart range mismatch" in result.error
+
 
 class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
     async def test_authentication_and_persistent_connection_reuse_stat_only(self):

@@ -133,6 +133,7 @@ def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
 
 def validate_yenc_body(lines: Iterable[bytes | str]) -> YencValidationResult:
     ybegin_attrs: dict[str, str] | None = None
+    ypart_attrs: dict[str, str] | None = None
     yend_attrs: dict[str, str] | None = None
     data_lines: list[bytes] = []
 
@@ -143,6 +144,7 @@ def validate_yenc_body(lines: Iterable[bytes | str]) -> YencValidationResult:
             ybegin_attrs = _parse_yenc_attrs(line)
             continue
         if line.startswith(b"=ypart"):
+            ypart_attrs = _parse_yenc_attrs(line)
             continue
         if line.startswith(b"=yend"):
             yend_attrs = _parse_yenc_attrs(line)
@@ -175,6 +177,38 @@ def validate_yenc_body(lines: Iterable[bytes | str]) -> YencValidationResult:
                 ok=False,
                 decoded_size=len(decoded),
                 error=f"size mismatch: expected {size_value}, got {len(decoded)}",
+            )
+
+    if ypart_attrs is not None:
+        begin_text = ypart_attrs.get("begin")
+        end_text = ypart_attrs.get("end")
+        if begin_text is None or end_text is None:
+            return YencValidationResult(
+                ok=False,
+                decoded_size=len(decoded),
+                error="invalid ypart: missing begin/end",
+            )
+        try:
+            begin_value = int(begin_text)
+            end_value = int(end_text)
+        except ValueError:
+            return YencValidationResult(
+                ok=False,
+                decoded_size=len(decoded),
+                error=f"invalid ypart range: begin={begin_text} end={end_text}",
+            )
+        if begin_value < 1 or end_value < begin_value:
+            return YencValidationResult(
+                ok=False,
+                decoded_size=len(decoded),
+                error=f"invalid ypart range: begin={begin_value} end={end_value}",
+            )
+        expected_part_size = end_value - begin_value + 1
+        if expected_part_size != len(decoded):
+            return YencValidationResult(
+                ok=False,
+                decoded_size=len(decoded),
+                error=f"ypart range mismatch: expected {expected_part_size}, got {len(decoded)}",
             )
 
     expected_crc = yend_attrs.get("pcrc32") or yend_attrs.get("crc32")
