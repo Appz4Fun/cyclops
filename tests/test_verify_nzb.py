@@ -2,6 +2,7 @@ import asyncio
 import io
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 import unittest
 
@@ -14,12 +15,14 @@ class FakeNntpServer:
         username=None,
         password=None,
         initial_code="200 fake ready",
+        greeting_delay=0,
         stat_delay=None,
     ):
         self.stat_responses = stat_responses
         self.username = username
         self.password = password
         self.initial_code = initial_code
+        self.greeting_delay = greeting_delay
         self.stat_delay = stat_delay or {}
         self.server = None
         self.host = "127.0.0.1"
@@ -39,6 +42,8 @@ class FakeNntpServer:
 
     async def _handle_client(self, reader, writer):
         self.connection_count += 1
+        if self.greeting_delay:
+            await asyncio.sleep(self.greeting_delay)
         writer.write((self.initial_code + "\r\n").encode("ascii"))
         await writer.drain()
         authed = self.username is None
@@ -234,6 +239,171 @@ class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
             command.startswith("AUTHINFO ") or command.startswith("STAT ")
             for command in server.commands
         )
+
+    async def test_stat_wraps_unbracketed_nzb_message_ids(self):
+        import verify_nzb
+
+        async with FakeNntpServer(
+            stat_responses={
+                "<bare@example.invalid>": 223,
+            }
+        ) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                nzb_path = tmp / "input.nzb"
+                config_path = tmp / "nntp.ini"
+                nzb_path.write_text(
+                    make_nzb(
+                        """
+                        <nzb>
+                          <file><segments><segment>bare@example.invalid</segment></segments></file>
+                        </nzb>
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [server.primary]
+                        host = {server.host}
+                        port = {server.port}
+                        ssl = false
+                        max_connections = 1
+                        timeout = 1
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+
+                summary = await verify_nzb.verify_nzb(
+                    nzb_path,
+                    config_path,
+                    retries=0,
+                    progress_stream=io.StringIO(),
+                )
+
+        assert summary.present == 1
+        assert server.stat_commands == ["<bare@example.invalid>"]
+
+    async def test_progress_output_is_in_place_with_final_newline(self):
+        import verify_nzb
+
+        async with FakeNntpServer(
+            stat_responses={
+                "<one@example.invalid>": 223,
+                "<two@example.invalid>": 223,
+            }
+        ) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                nzb_path = tmp / "input.nzb"
+                config_path = tmp / "nntp.ini"
+                nzb_path.write_text(
+                    make_nzb(
+                        """
+                        <nzb>
+                          <file><segments><segment>&lt;one@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;two@example.invalid&gt;</segment></segments></file>
+                        </nzb>
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [server.primary]
+                        host = {server.host}
+                        port = {server.port}
+                        ssl = false
+                        max_connections = 1
+                        timeout = 1
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+
+                progress = io.StringIO()
+                summary = await verify_nzb.verify_nzb(
+                    nzb_path,
+                    config_path,
+                    retries=0,
+                    progress_stream=progress,
+                )
+
+        output = progress.getvalue()
+        assert summary.present == 2
+        assert output.count("\r") >= 2
+        assert output.count("\n") == 1
+        assert output.endswith("\n")
+
+    async def test_shared_queue_keeps_fast_workers_busy(self):
+        import verify_nzb
+
+        slow_responses = {f"<slow-{index}@example.invalid>": 430 for index in range(8)}
+        fast_responses = {f"<slow-{index}@example.invalid>": 223 for index in range(8)}
+
+        async with FakeNntpServer(
+            stat_responses=slow_responses,
+            stat_delay={message_id: 0.2 for message_id in slow_responses},
+        ) as slow_server, FakeNntpServer(
+            stat_responses=fast_responses,
+        ) as fast_server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                nzb_path = tmp / "input.nzb"
+                config_path = tmp / "nntp.ini"
+                nzb_path.write_text(
+                    make_nzb(
+                        """
+                        <nzb>
+                          <file><segments><segment>&lt;slow-0@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;slow-1@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;slow-2@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;slow-3@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;slow-4@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;slow-5@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;slow-6@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;slow-7@example.invalid&gt;</segment></segments></file>
+                        </nzb>
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [server.primary]
+                        host = {slow_server.host}
+                        port = {slow_server.port}
+                        ssl = false
+                        max_connections = 1
+                        timeout = 1
+
+                        [server.secondary]
+                        host = {fast_server.host}
+                        port = {fast_server.port}
+                        ssl = false
+                        max_connections = 4
+                        timeout = 1
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+
+                summary = await verify_nzb.verify_nzb(
+                    nzb_path,
+                    config_path,
+                    retries=0,
+                    progress_stream=io.StringIO(),
+                )
+
+        assert summary.total_checked == 8
+        assert summary.present == 8
+        assert summary.elapsed_seconds < 0.55
+        assert slow_server.connection_count == 1
+        assert fast_server.connection_count == 4
 
     async def test_active_active_multi_server_behavior_and_cross_server_verification(self):
         import verify_nzb

@@ -7,6 +7,7 @@ import ssl as ssl_module
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -63,6 +64,13 @@ def parse_nzb_message_ids(path: str | Path) -> Iterator[str]:
             if text:
                 yield text
             elem.clear()
+
+
+def normalize_message_id(message_id: str) -> str:
+    text = message_id.strip()
+    if text.startswith("<") and text.endswith(">"):
+        return text
+    return f"<{text.strip('<>')}>"
 
 
 def load_config(path: str | Path) -> list[ServerConfig]:
@@ -207,7 +215,7 @@ class AsyncNntpConnection:
     async def _stat_once(self, message_id: str) -> int:
         await self._connect_once()
         self.request_count += 1
-        code, _ = await self._send_command(f"STAT {message_id}")
+        code, _ = await self._send_command(f"STAT {normalize_message_id(message_id)}")
         if code in (223, 430):
             return code
         raise ProtocolNntpError(f"unexpected STAT response {code}")
@@ -241,7 +249,7 @@ class AsyncNntpConnection:
 @dataclass
 class _Job:
     message_id: str
-    server_index: int
+    target_server_index: int | None = None
 
 
 @dataclass
@@ -249,6 +257,7 @@ class _MessageState:
     tried_servers: set[int] = field(default_factory=set)
     final_status: str | None = None
     had_error: bool = False
+    queued: bool = False
 
 
 class _Verifier:
@@ -262,7 +271,8 @@ class _Verifier:
         self.servers = servers
         self.retries = retries
         self.progress_stream = progress_stream
-        self.queues: list[asyncio.Queue[_Job | None]] = [asyncio.Queue() for _ in servers]
+        self.jobs: deque[_Job] = deque()
+        self.job_condition = asyncio.Condition()
         self.connections: list[list[AsyncNntpConnection]] = [
             [AsyncNntpConnection(server) for _ in range(server.max_connections)]
             for server in servers
@@ -274,11 +284,11 @@ class _Verifier:
         self.present = 0
         self.missing = 0
         self.error = 0
-        self._pending_jobs = 0
         self._input_complete = False
+        self._pending_messages = 0
         self._finished = asyncio.Event()
-        self._state_lock = asyncio.Lock()
-        self._next_initial_server = 0
+        self._shutdown = False
+        self._progress_was_written = False
 
     async def run(self, message_ids: Iterable[str], missing_output: str | Path | None = None) -> VerificationSummary:
         start = time.monotonic()
@@ -287,14 +297,16 @@ class _Verifier:
             for message_id in message_ids:
                 self.total_checked += 1
                 self.states.setdefault(message_id, _MessageState())
-                await self._enqueue_initial(message_id)
-            async with self._state_lock:
+                async with self.job_condition:
+                    self._pending_messages += 1
+                await self._enqueue_message(message_id)
+            async with self.job_condition:
                 self._input_complete = True
-                if self._pending_jobs == 0:
-                    self._finished.set()
+                self._maybe_finish_locked()
             await self._finished.wait()
         finally:
             await self._stop_workers()
+        self._finish_progress()
 
         if missing_output is not None:
             path = Path(missing_output)
@@ -319,17 +331,15 @@ class _Verifier:
                 task = asyncio.create_task(self._worker_loop(server_index, connection))
                 self.workers.append(task)
 
-        for server_connections in self.connections:
-            for connection in server_connections:
-                try:
-                    await connection.connect(self.retries)
-                except NntpError:
-                    pass
+        await asyncio.gather(
+            *(connection.connect(self.retries) for server_connections in self.connections for connection in server_connections),
+            return_exceptions=True,
+        )
 
     async def _stop_workers(self) -> None:
-        for server_index, queue in enumerate(self.queues):
-            for _ in range(len(self.connections[server_index])):
-                await queue.put(None)
+        async with self.job_condition:
+            self._shutdown = True
+            self.job_condition.notify_all()
         if self.workers:
             await asyncio.gather(*self.workers, return_exceptions=True)
         for server_connections in self.connections:
@@ -337,61 +347,108 @@ class _Verifier:
                 await connection.close()
 
     async def _worker_loop(self, server_index: int, connection: AsyncNntpConnection) -> None:
-        queue = self.queues[server_index]
         try:
             while True:
-                job = await queue.get()
-                try:
-                    if job is None:
-                        return
-                    await self._handle_job(connection, job)
-                finally:
-                    queue.task_done()
-                    if job is not None:
-                        await self._job_completed()
+                job = await self._take_job(server_index)
+                if job is None:
+                    return
+                await self._handle_job(server_index, connection, job.message_id, job.target_server_index)
         except asyncio.CancelledError:
             raise
 
-    async def _handle_job(self, connection: AsyncNntpConnection, job: _Job) -> None:
-        state = self.states[job.message_id]
-        if state.final_status is not None or job.server_index in state.tried_servers:
-            return
+    async def _take_job(self, server_index: int) -> _Job | None:
+        async with self.job_condition:
+            while True:
+                job = self._find_job_for_server(server_index)
+                if job is not None:
+                    self.jobs.remove(job)
+                    self.states[job.message_id].queued = False
+                    return job
+                if self._shutdown:
+                    return None
+                await self.job_condition.wait()
+
+    def _find_job_for_server(self, server_index: int) -> _Job | None:
+        for job in self.jobs:
+            if job.target_server_index is None or job.target_server_index == server_index:
+                return job
+        return None
+
+    async def _handle_job(
+        self,
+        server_index: int,
+        connection: AsyncNntpConnection,
+        message_id: str,
+        target_server_index: int | None,
+    ) -> None:
+        state = self.states[message_id]
+        async with self.job_condition:
+            if state.final_status is not None:
+                return
+            if target_server_index is None:
+                state.next_server_index = server_index
+            elif target_server_index != server_index:
+                self._defer_message_locked(message_id, target_server_index)
+                return
+            state.tried_servers.add(server_index)
 
         try:
-            code = await connection.stat(job.message_id, self.retries)
+            code = await connection.stat(message_id, self.retries)
         except TransientNntpError:
-            state.had_error = True
-            state.tried_servers.add(job.server_index)
-            await self._schedule_next(job.message_id, job.server_index)
-            return
+            async with self.job_condition:
+                state.had_error = True
+                next_index = self._next_server_index_locked(state, server_index)
+                if next_index is not None:
+                    self._defer_message_locked(message_id, next_index)
+                    return
+                await self._finalize_locked(message_id, "error")
+                return
         except ProtocolNntpError:
+            async with self.job_condition:
+                state.had_error = True
+                next_index = self._next_server_index_locked(state, server_index)
+                if next_index is not None:
+                    self._defer_message_locked(message_id, next_index)
+                    return
+                await self._finalize_locked(message_id, "error")
+                return
+
+        async with self.job_condition:
+            if code == 223:
+                await self._finalize_locked(message_id, "present")
+                return
+            next_index = self._next_server_index_locked(state, server_index)
+            if code == 430:
+                if next_index is not None:
+                    self._defer_message_locked(message_id, next_index)
+                    return
+                await self._finalize_locked(message_id, "error" if state.had_error else "missing")
+                return
             state.had_error = True
-            state.tried_servers.add(job.server_index)
-            await self._schedule_next(job.message_id, job.server_index)
-            return
+            if next_index is not None:
+                self._defer_message_locked(message_id, next_index)
+                return
+            await self._finalize_locked(message_id, "error")
 
-        state.tried_servers.add(job.server_index)
-        if code == 223:
-            await self._finalize(job.message_id, "present")
-            return
+    async def _enqueue_message(self, message_id: str) -> None:
+        async with self.job_condition:
+            state = self.states[message_id]
+            if state.final_status is not None or state.queued:
+                return
+            state.queued = True
+            self.jobs.append(_Job(message_id=message_id))
+            self.job_condition.notify_all()
 
-        if code == 430:
-            await self._schedule_next(job.message_id, job.server_index)
-            return
-
-        state.had_error = True
-        await self._schedule_next(job.message_id, job.server_index)
-
-    async def _schedule_next(self, message_id: str, current_server_index: int) -> None:
+    def _defer_message_locked(self, message_id: str, server_index: int) -> None:
         state = self.states[message_id]
-        next_server_index = self._next_server_index(state, current_server_index)
-        if next_server_index is None:
-            final_status = "error" if state.had_error else "missing"
-            await self._finalize(message_id, final_status)
+        if state.final_status is not None or state.queued:
             return
-        await self._enqueue_job(message_id, next_server_index)
+        state.queued = True
+        state.next_server_index = server_index
+        self.jobs.append(_Job(message_id=message_id, target_server_index=server_index))
+        self.job_condition.notify_all()
 
-    def _next_server_index(self, state: _MessageState, current_server_index: int) -> int | None:
+    def _next_server_index_locked(self, state: _MessageState, current_server_index: int) -> int | None:
         total = len(self.servers)
         for offset in range(1, total + 1):
             candidate = (current_server_index + offset) % total
@@ -399,23 +456,7 @@ class _Verifier:
                 return candidate
         return None
 
-    async def _enqueue_initial(self, message_id: str) -> None:
-        server_index = self._next_initial_server
-        self._next_initial_server = (self._next_initial_server + 1) % len(self.servers)
-        await self._enqueue_job(message_id, server_index)
-
-    async def _enqueue_job(self, message_id: str, server_index: int) -> None:
-        async with self._state_lock:
-            self._pending_jobs += 1
-        await self.queues[server_index].put(_Job(message_id=message_id, server_index=server_index))
-
-    async def _job_completed(self) -> None:
-        async with self._state_lock:
-            self._pending_jobs -= 1
-            if self._input_complete and self._pending_jobs == 0:
-                self._finished.set()
-
-    async def _finalize(self, message_id: str, final_status: str) -> None:
+    async def _finalize_locked(self, message_id: str, final_status: str) -> None:
         state = self.states[message_id]
         if state.final_status is not None:
             return
@@ -429,17 +470,32 @@ class _Verifier:
             self.error += 1
             self.issues.append((message_id, "error"))
         self._write_progress(message_id, final_status)
+        self._pending_messages -= 1
+        self._maybe_finish_locked()
 
     def _write_progress(self, message_id: str, final_status: str) -> None:
         stream = self.progress_stream
         stream.write(
+            "\r"
             f"checked {self.total_checked} total, present={self.present}, missing={self.missing}, "
-            f"error={self.error}, last={message_id} => {final_status}\n"
+            f"error={self.error}, last={message_id} => {final_status}"
         )
         flush = getattr(stream, "flush", None)
         if callable(flush):
             flush()
+        self._progress_was_written = True
 
+    def _maybe_finish_locked(self) -> None:
+        if self._input_complete and self._pending_messages == 0:
+            self._finished.set()
+
+    def _finish_progress(self) -> None:
+        if not self._progress_was_written:
+            return
+        self.progress_stream.write("\n")
+        flush = getattr(self.progress_stream, "flush", None)
+        if callable(flush):
+            flush()
 
 async def verify_nzb(
     nzb_path: str | Path,
