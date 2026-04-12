@@ -297,9 +297,7 @@ class _Verifier:
             for message_id in message_ids:
                 self.total_checked += 1
                 self.states.setdefault(message_id, _MessageState())
-                if await self._enqueue_message(message_id):
-                    async with self.job_condition:
-                        self._pending_messages += 1
+                await self._enqueue_message(message_id)
             async with self.job_condition:
                 self._input_complete = True
                 self._maybe_finish_locked()
@@ -436,6 +434,7 @@ class _Verifier:
             if state.final_status is not None or state.queued:
                 return False
             state.queued = True
+            self._pending_messages += 1
             self.jobs.append(_Job(message_id=message_id))
             self.job_condition.notify_all()
             return True

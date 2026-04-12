@@ -341,6 +341,27 @@ class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
         assert summary.error == 0
         assert server.stat_commands == ["<dup@example.invalid>"]
 
+    async def test_enqueue_unique_message_updates_pending_counter_atomically(self):
+        import verify_nzb
+
+        server = verify_nzb.ServerConfig(
+            name="primary",
+            host="127.0.0.1",
+            port=119,
+            ssl=False,
+            username=None,
+            password=None,
+            max_connections=1,
+            timeout=1,
+        )
+        verifier = verify_nzb._Verifier([server], retries=0, progress_stream=io.StringIO())
+        verifier.states["<one@example.invalid>"] = verify_nzb._MessageState()
+
+        queued = await verifier._enqueue_message("<one@example.invalid>")
+
+        assert queued is True
+        assert verifier._pending_messages == 1
+
     async def test_progress_output_is_in_place_with_final_newline(self):
         import verify_nzb
 
