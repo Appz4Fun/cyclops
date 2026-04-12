@@ -370,6 +370,30 @@ class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
         assert queued is True
         assert verifier._pending_messages == 1
 
+    async def test_in_flight_duplicate_message_is_not_queued_again(self):
+        import verify_nzb
+
+        server = verify_nzb.ServerConfig(
+            name="primary",
+            host="127.0.0.1",
+            port=119,
+            ssl=False,
+            username=None,
+            password=None,
+            max_connections=1,
+            timeout=1,
+        )
+        verifier = verify_nzb._Verifier([server], retries=0, progress_stream=io.StringIO())
+        verifier.states["<one@example.invalid>"] = verify_nzb._MessageState()
+        assert await verifier._enqueue_message("<one@example.invalid>") is True
+
+        job = await verifier._take_job(0)
+        duplicate_queued = await verifier._enqueue_message("<one@example.invalid>")
+
+        assert job is not None
+        assert duplicate_queued is False
+        assert verifier._pending_messages == 1
+
     async def test_non_ascii_message_id_finishes_as_error_without_deadlock(self):
         import verify_nzb
 

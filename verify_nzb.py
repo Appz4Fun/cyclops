@@ -260,6 +260,7 @@ class _MessageState:
     final_status: str | None = None
     had_error: bool = False
     queued: bool = False
+    in_flight: bool = False
 
 
 class _Verifier:
@@ -370,7 +371,9 @@ class _Verifier:
                 job = self._find_job_for_server(server_index)
                 if job is not None:
                     self.jobs.remove(job)
-                    self.states[job.message_id].queued = False
+                    state = self.states[job.message_id]
+                    state.queued = False
+                    state.in_flight = True
                     return job
                 if self._shutdown:
                     return None
@@ -392,6 +395,7 @@ class _Verifier:
         state = self.states[message_id]
         async with self.job_condition:
             if state.final_status is not None:
+                state.in_flight = False
                 return
             if target_server_index is not None and target_server_index != server_index:
                 self._defer_message_locked(message_id, target_server_index)
@@ -439,7 +443,7 @@ class _Verifier:
     async def _enqueue_message(self, message_id: str) -> bool:
         async with self.job_condition:
             state = self.states[message_id]
-            if state.final_status is not None or state.queued:
+            if state.final_status is not None or state.queued or state.in_flight:
                 return False
             state.queued = True
             self._pending_messages += 1
@@ -451,6 +455,7 @@ class _Verifier:
         state = self.states[message_id]
         if state.final_status is not None or state.queued:
             return
+        state.in_flight = False
         state.queued = True
         self.jobs.append(_Job(message_id=message_id, target_server_index=server_index))
         self.job_condition.notify_all()
@@ -468,6 +473,7 @@ class _Verifier:
         if state.final_status is not None:
             return
         state.final_status = final_status
+        state.in_flight = False
         if final_status == "present":
             self.present += 1
         elif final_status == "missing":
