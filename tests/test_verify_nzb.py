@@ -1,4 +1,5 @@
 import asyncio
+import binascii
 import io
 import tempfile
 import textwrap
@@ -17,6 +18,8 @@ class FakeNntpServer:
         initial_code="200 fake ready",
         greeting_delay=0,
         stat_delay=None,
+        body_responses=None,
+        body_delay=None,
     ):
         self.stat_responses = stat_responses
         self.username = username
@@ -24,12 +27,15 @@ class FakeNntpServer:
         self.initial_code = initial_code
         self.greeting_delay = greeting_delay
         self.stat_delay = stat_delay or {}
+        self.body_responses = body_responses or {}
+        self.body_delay = body_delay or {}
         self.server = None
         self.host = "127.0.0.1"
         self.port = None
         self.connection_count = 0
         self.commands = []
         self.stat_commands = []
+        self.body_commands = []
 
     async def __aenter__(self):
         self.server = await asyncio.start_server(self._handle_client, self.host, 0)
@@ -98,6 +104,32 @@ class FakeNntpServer:
                     await writer.drain()
                     continue
 
+                if command.startswith("BODY "):
+                    self.body_commands.append(command[len("BODY ") :])
+                    if self.username is not None and not authed:
+                        writer.write(b"480 authentication required\r\n")
+                        await writer.drain()
+                        continue
+                    message_id = command[len("BODY ") :]
+                    delay = self.body_delay.get(message_id, 0)
+                    if delay:
+                        await asyncio.sleep(delay)
+                    body = self.body_responses.get(message_id)
+                    if body is None:
+                        writer.write(f"430 {message_id}\r\n".encode("ascii"))
+                        await writer.drain()
+                        continue
+                    writer.write(f"222 0 {message_id}\r\n".encode("ascii"))
+                    for line in body:
+                        if isinstance(line, str):
+                            line = line.encode("latin-1")
+                        if line.startswith(b"."):
+                            line = b"." + line
+                        writer.write(line + b"\r\n")
+                    writer.write(b".\r\n")
+                    await writer.drain()
+                    continue
+
                 writer.write(b"500 command unsupported\r\n")
                 await writer.drain()
         finally:
@@ -107,6 +139,28 @@ class FakeNntpServer:
 
 def make_nzb(contents):
     return textwrap.dedent(contents).lstrip()
+
+
+def yenc_encode(data):
+    encoded = bytearray()
+    for byte in data:
+        shifted = (byte + 42) % 256
+        if shifted in (0, 10, 13, 61):
+            encoded.append(61)
+            encoded.append((shifted + 64) % 256)
+        else:
+            encoded.append(shifted)
+    return bytes(encoded)
+
+
+def yenc_body(data, *, crc=None):
+    if crc is None:
+        crc = binascii.crc32(data) & 0xFFFFFFFF
+    return [
+        f"=ybegin line=128 size={len(data)} name=test.bin".encode("ascii"),
+        yenc_encode(data),
+        f"=yend size={len(data)} crc32={crc:08x}".encode("ascii"),
+    ]
 
 
 class BrokenProgress:
@@ -185,6 +239,24 @@ class TestVerifyNzbParsingAndConfig(unittest.TestCase):
             assert servers[0].timeout == 3.5
             assert servers[1].host == "news2.example.com"
             assert servers[1].ssl is False
+
+    def test_yenc_body_validator_accepts_crc32(self):
+        import verify_nzb
+
+        result = verify_nzb.validate_yenc_body(yenc_body(b"hello world"))
+
+        assert result.ok is True
+        assert result.decoded_size == 11
+        assert result.error is None
+
+    def test_yenc_body_validator_rejects_bad_crc32(self):
+        import verify_nzb
+
+        result = verify_nzb.validate_yenc_body(yenc_body(b"hello world", crc=0))
+
+        assert result.ok is False
+        assert result.decoded_size == 11
+        assert "crc32 mismatch" in result.error
 
 
 class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
@@ -745,6 +817,97 @@ class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
         assert summary.missing == 0
         assert summary.error == 1
         assert output == ["<missing@example.invalid>\terror"]
+
+    async def test_deep_check_all_sampled_bodies_reports_ok_and_corrupt(self):
+        import verify_nzb
+
+        async with FakeNntpServer(
+            stat_responses={
+                "<good@example.invalid>": 223,
+                "<bad@example.invalid>": 223,
+            },
+            body_responses={
+                "<good@example.invalid>": yenc_body(b"good-data"),
+                "<bad@example.invalid>": yenc_body(b"bad-data", crc=0),
+            },
+        ) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                nzb_path = tmp / "input.nzb"
+                config_path = tmp / "nntp.ini"
+                deep_output = tmp / "deep.txt"
+                nzb_path.write_text(
+                    make_nzb(
+                        """
+                        <nzb>
+                          <file><segments><segment>&lt;good@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;bad@example.invalid&gt;</segment></segments></file>
+                        </nzb>
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [server.primary]
+                        host = {server.host}
+                        port = {server.port}
+                        ssl = false
+                        max_connections = 1
+                        timeout = 1
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+
+                summary = await verify_nzb.verify_nzb(
+                    nzb_path,
+                    config_path,
+                    retries=0,
+                    progress_stream=io.StringIO(),
+                    deep_check=True,
+                    sample_percent=100,
+                    sample_seed=7,
+                    deep_output=deep_output,
+                )
+
+                output = deep_output.read_text(encoding="utf-8").splitlines()
+
+        assert summary.present == 2
+        assert summary.deep is not None
+        assert summary.deep.sampled == 2
+        assert summary.deep.ok == 1
+        assert summary.deep.corrupt == 1
+        assert summary.deep.error == 0
+        assert summary.deep.body_requests == 2
+        assert sorted(server.body_commands) == ["<bad@example.invalid>", "<good@example.invalid>"]
+        assert all(not command.startswith(("HEAD ", "ARTICLE ")) for command in server.commands)
+        assert any(line.startswith("<good@example.invalid>\tok\t") for line in output)
+        assert any(line.startswith("<bad@example.invalid>\tcorrupt\t") for line in output)
+
+    def test_cli_accepts_deep_check_options(self):
+        import verify_nzb
+
+        args = verify_nzb.build_arg_parser().parse_args(
+            [
+                "input.nzb",
+                "--config",
+                "nntp.ini",
+                "--deep-check",
+                "--sample-percent",
+                "2.5",
+                "--sample-seed",
+                "123",
+                "--deep-output",
+                "deep.txt",
+            ]
+        )
+
+        assert args.deep_check is True
+        assert args.sample_percent == 2.5
+        assert args.sample_seed == 123
+        assert args.deep_output == Path("deep.txt")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import binascii
 import configparser
+import math
+import random
 import ssl as ssl_module
 import sys
 import time
@@ -26,6 +29,16 @@ class ServerConfig:
 
 
 @dataclass
+class DeepCheckSummary:
+    sampled: int
+    ok: int
+    corrupt: int
+    error: int
+    body_requests: int
+    elapsed_seconds: float
+
+
+@dataclass
 class VerificationSummary:
     total_checked: int
     present: int
@@ -33,6 +46,22 @@ class VerificationSummary:
     error: int
     stat_requests: int
     elapsed_seconds: float
+    deep: DeepCheckSummary | None = None
+
+
+@dataclass(frozen=True)
+class YencValidationResult:
+    ok: bool
+    decoded_size: int
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class DeepCheckResult:
+    message_id: str
+    status: str
+    detail: str
+    server: str | None = None
 
 
 class NntpError(Exception):
@@ -45,6 +74,10 @@ class TransientNntpError(NntpError):
 
 class ProtocolNntpError(NntpError):
     """An unexpected NNTP response."""
+
+
+class MissingArticleError(NntpError):
+    """The NNTP server does not have the requested article."""
 
 
 def _local_name(tag: str) -> str:
@@ -71,6 +104,107 @@ def normalize_message_id(message_id: str) -> str:
     if text.startswith("<") and text.endswith(">"):
         return text
     return f"<{text.strip('<>')}>"
+
+
+def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for token in line.decode("latin-1", errors="replace").split()[1:]:
+        if "=" in token:
+            key, value = token.split("=", 1)
+            attrs[key.lower()] = value
+    return attrs
+
+
+def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
+    decoded = bytearray()
+    for line in lines:
+        index = 0
+        while index < len(line):
+            byte = line[index]
+            if byte == 61:
+                index += 1
+                if index >= len(line):
+                    raise ValueError("dangling yEnc escape")
+                byte = (line[index] - 64) % 256
+            decoded.append((byte - 42) % 256)
+            index += 1
+    return bytes(decoded)
+
+
+def validate_yenc_body(lines: Iterable[bytes | str]) -> YencValidationResult:
+    ybegin_attrs: dict[str, str] | None = None
+    yend_attrs: dict[str, str] | None = None
+    data_lines: list[bytes] = []
+
+    for raw_line in lines:
+        line = raw_line.encode("latin-1") if isinstance(raw_line, str) else bytes(raw_line)
+        line = line.rstrip(b"\r\n")
+        if line.startswith(b"=ybegin"):
+            ybegin_attrs = _parse_yenc_attrs(line)
+            continue
+        if line.startswith(b"=ypart"):
+            continue
+        if line.startswith(b"=yend"):
+            yend_attrs = _parse_yenc_attrs(line)
+            break
+        if ybegin_attrs is not None:
+            data_lines.append(line)
+
+    if ybegin_attrs is None:
+        return YencValidationResult(ok=False, decoded_size=0, error="missing ybegin")
+    if yend_attrs is None:
+        return YencValidationResult(ok=False, decoded_size=0, error="missing yend")
+
+    try:
+        decoded = _decode_yenc_lines(data_lines)
+    except ValueError as exc:
+        return YencValidationResult(ok=False, decoded_size=0, error=str(exc))
+
+    expected_size = yend_attrs.get("size") or ybegin_attrs.get("size")
+    if expected_size is not None:
+        try:
+            size_value = int(expected_size)
+        except ValueError:
+            return YencValidationResult(
+                ok=False,
+                decoded_size=len(decoded),
+                error=f"invalid yEnc size: {expected_size}",
+            )
+        if len(decoded) != size_value:
+            return YencValidationResult(
+                ok=False,
+                decoded_size=len(decoded),
+                error=f"size mismatch: expected {size_value}, got {len(decoded)}",
+            )
+
+    expected_crc = yend_attrs.get("pcrc32") or yend_attrs.get("crc32")
+    if expected_crc is not None:
+        actual_crc = f"{binascii.crc32(decoded) & 0xFFFFFFFF:08x}"
+        if actual_crc.lower() != expected_crc.lower():
+            return YencValidationResult(
+                ok=False,
+                decoded_size=len(decoded),
+                error=f"crc32 mismatch: expected {expected_crc.lower()}, got {actual_crc}",
+            )
+
+    return YencValidationResult(ok=True, decoded_size=len(decoded), error=None)
+
+
+def select_deep_sample(
+    message_ids: Iterable[str],
+    *,
+    sample_percent: float,
+    sample_seed: int | None,
+) -> list[str]:
+    if not 0 < sample_percent <= 100:
+        raise ValueError("sample_percent must be greater than 0 and at most 100")
+    unique_ids = list(dict.fromkeys(message_ids))
+    if not unique_ids:
+        return []
+    sample_size = min(len(unique_ids), max(1, math.ceil(len(unique_ids) * sample_percent / 100)))
+    if sample_size == len(unique_ids):
+        return unique_ids
+    return random.Random(sample_seed).sample(unique_ids, sample_size)
 
 
 def load_config(path: str | Path) -> list[ServerConfig]:
@@ -137,12 +271,16 @@ class AsyncNntpConnection:
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self.request_count = 0
+        self.body_request_count = 0
 
     async def connect(self, retries: int = 0) -> None:
         await self._retry(self._connect_once, retries)
 
     async def stat(self, message_id: str, retries: int = 0) -> int:
         return await self._retry(self._stat_once, retries, message_id)
+
+    async def body(self, message_id: str, retries: int = 0) -> list[bytes]:
+        return await self._retry(self._body_once, retries, message_id)
 
     async def close(self) -> None:
         writer = self._writer
@@ -220,6 +358,16 @@ class AsyncNntpConnection:
             return code
         raise ProtocolNntpError(f"unexpected STAT response {code}")
 
+    async def _body_once(self, message_id: str) -> list[bytes]:
+        await self._connect_once()
+        self.body_request_count += 1
+        code, _ = await self._send_command(f"BODY {normalize_message_id(message_id)}")
+        if code == 222:
+            return await self._read_multiline()
+        if code == 430:
+            raise MissingArticleError(f"missing article: {message_id}")
+        raise ProtocolNntpError(f"unexpected BODY response {code}")
+
     async def _send_command(self, command: str) -> tuple[int, str]:
         assert self._writer is not None
         assert self._reader is not None
@@ -246,6 +394,23 @@ class AsyncNntpConnection:
         if len(text) < 3 or not text[:3].isdigit():
             raise ProtocolNntpError(f"malformed response: {text!r}")
         return int(text[:3]), text[4:] if len(text) > 4 else ""
+
+    async def _read_multiline(self) -> list[bytes]:
+        assert self._reader is not None
+        lines: list[bytes] = []
+        while True:
+            try:
+                line = await asyncio.wait_for(self._reader.readline(), timeout=self.config.timeout)
+            except asyncio.TimeoutError as exc:
+                raise TransientNntpError("read timeout") from exc
+            if not line:
+                raise TransientNntpError("connection closed")
+            line = line.rstrip(b"\r\n")
+            if line == b".":
+                return lines
+            if line.startswith(b".."):
+                line = line[1:]
+            lines.append(line)
 
 
 @dataclass
@@ -287,6 +452,7 @@ class _Verifier:
         self.present = 0
         self.missing = 0
         self.error = 0
+        self.present_message_ids: list[str] = []
         self._input_complete = False
         self._pending_messages = 0
         self._finished = asyncio.Event()
@@ -476,6 +642,7 @@ class _Verifier:
         state.in_flight = False
         if final_status == "present":
             self.present += 1
+            self.present_message_ids.append(message_id)
         elif final_status == "missing":
             self.missing += 1
             self.issues.append((message_id, "missing"))
@@ -518,17 +685,128 @@ class _Verifier:
         except OSError:
             self._progress_failed = True
 
+
+class _DeepVerifier:
+    def __init__(self, servers: list[ServerConfig], *, retries: int):
+        self.servers = servers
+        self.retries = retries
+        self.connection_queues: list[asyncio.Queue[AsyncNntpConnection]] = [
+            asyncio.Queue() for _ in servers
+        ]
+        self.connections: list[list[AsyncNntpConnection]] = [
+            [AsyncNntpConnection(server) for _ in range(server.max_connections)]
+            for server in servers
+        ]
+
+    async def run(
+        self,
+        message_ids: list[str],
+        *,
+        deep_output: str | Path | None = None,
+    ) -> DeepCheckSummary:
+        start = time.monotonic()
+        try:
+            await self._start()
+            results = await asyncio.gather(
+                *(self._check_one(index, message_id) for index, message_id in enumerate(message_ids))
+            )
+        finally:
+            await self._stop()
+
+        if deep_output is not None:
+            with Path(deep_output).open("w", encoding="utf-8") as handle:
+                for result in results:
+                    server = result.server or "-"
+                    handle.write(f"{result.message_id}\t{result.status}\t{result.detail}\t{server}\n")
+
+        elapsed = time.monotonic() - start
+        return DeepCheckSummary(
+            sampled=len(message_ids),
+            ok=sum(1 for result in results if result.status == "ok"),
+            corrupt=sum(1 for result in results if result.status == "corrupt"),
+            error=sum(1 for result in results if result.status == "error"),
+            body_requests=sum(
+                connection.body_request_count
+                for server_connections in self.connections
+                for connection in server_connections
+            ),
+            elapsed_seconds=elapsed,
+        )
+
+    async def _start(self) -> None:
+        await asyncio.gather(
+            *(connection.connect(self.retries) for server_connections in self.connections for connection in server_connections),
+            return_exceptions=True,
+        )
+        for server_index, server_connections in enumerate(self.connections):
+            for connection in server_connections:
+                self.connection_queues[server_index].put_nowait(connection)
+
+    async def _stop(self) -> None:
+        for server_connections in self.connections:
+            for connection in server_connections:
+                await connection.close()
+
+    async def _check_one(self, sample_index: int, message_id: str) -> DeepCheckResult:
+        last_error = "article body unavailable"
+        server_count = len(self.servers)
+        for offset in range(server_count):
+            server_index = (sample_index + offset) % server_count
+            connection = await self.connection_queues[server_index].get()
+            try:
+                try:
+                    body_lines = await connection.body(message_id, self.retries)
+                except MissingArticleError:
+                    last_error = f"missing on {self.servers[server_index].name}"
+                    continue
+                except NntpError as exc:
+                    last_error = f"{self.servers[server_index].name}: {exc}"
+                    continue
+
+                validation = validate_yenc_body(body_lines)
+                if validation.ok:
+                    return DeepCheckResult(
+                        message_id=message_id,
+                        status="ok",
+                        detail=f"decoded_size={validation.decoded_size}",
+                        server=self.servers[server_index].name,
+                    )
+                return DeepCheckResult(
+                    message_id=message_id,
+                    status="corrupt",
+                    detail=validation.error or "yEnc validation failed",
+                    server=self.servers[server_index].name,
+                )
+            finally:
+                self.connection_queues[server_index].put_nowait(connection)
+
+        return DeepCheckResult(message_id=message_id, status="error", detail=last_error, server=None)
+
+
 async def verify_nzb(
     nzb_path: str | Path,
     config_path: str | Path,
     *,
     retries: int = 1,
     missing_output: str | Path | None = None,
+    deep_check: bool = False,
+    sample_percent: float = 1.0,
+    sample_seed: int | None = None,
+    deep_output: str | Path | None = None,
     progress_stream = sys.stdout,
 ) -> VerificationSummary:
     servers = load_config(config_path)
     verifier = _Verifier(servers, retries=retries, progress_stream=progress_stream)
-    return await verifier.run(parse_nzb_message_ids(nzb_path), missing_output=missing_output)
+    summary = await verifier.run(parse_nzb_message_ids(nzb_path), missing_output=missing_output)
+    if deep_check:
+        sampled_ids = select_deep_sample(
+            verifier.present_message_ids,
+            sample_percent=sample_percent,
+            sample_seed=sample_seed,
+        )
+        deep_verifier = _DeepVerifier(servers, retries=retries)
+        summary.deep = await deep_verifier.run(sampled_ids, deep_output=deep_output)
+    return summary
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -542,6 +820,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="write missing/error message IDs to this file",
     )
+    parser.add_argument(
+        "--deep-check",
+        action="store_true",
+        help="download a sampled set of present article bodies and validate yEnc CRC/size",
+    )
+    parser.add_argument(
+        "--sample-percent",
+        type=float,
+        default=1.0,
+        help="percentage of present articles to deep-check when --deep-check is set",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=None,
+        help="random seed for deterministic deep-check sampling",
+    )
+    parser.add_argument(
+        "--deep-output",
+        type=Path,
+        default=None,
+        help="write sampled deep-check results to this file",
+    )
     return parser
 
 
@@ -553,6 +854,10 @@ def main(argv: list[str] | None = None) -> int:
             args.config,
             retries=args.retries,
             missing_output=args.missing_output,
+            deep_check=args.deep_check,
+            sample_percent=args.sample_percent,
+            sample_seed=args.sample_seed,
+            deep_output=args.deep_output,
         )
     )
     print(
@@ -562,6 +867,14 @@ def main(argv: list[str] | None = None) -> int:
         f"elapsed={summary.elapsed_seconds:.3f}s",
         flush=True,
     )
+    if summary.deep is not None:
+        print(
+            "deep: "
+            f"sampled={summary.deep.sampled} ok={summary.deep.ok} corrupt={summary.deep.corrupt} "
+            f"error={summary.deep.error} body_requests={summary.deep.body_requests} "
+            f"elapsed={summary.deep.elapsed_seconds:.3f}s",
+            flush=True,
+        )
     return 0
 
 
