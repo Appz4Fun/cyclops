@@ -109,6 +109,14 @@ def make_nzb(contents):
     return textwrap.dedent(contents).lstrip()
 
 
+class BrokenProgress:
+    def write(self, text):
+        raise BrokenPipeError("progress stream closed")
+
+    def flush(self):
+        raise BrokenPipeError("progress stream closed")
+
+
 class TestVerifyNzbParsingAndConfig(unittest.TestCase):
     def test_parse_nzb_message_ids_streams_segment_text(self):
         import verify_nzb
@@ -465,6 +473,57 @@ class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
         assert output.count("\r") >= 2
         assert output.count("\n") == 1
         assert output.endswith("\n")
+
+    async def test_broken_progress_stream_does_not_deadlock_completion(self):
+        import verify_nzb
+
+        async with FakeNntpServer(
+            stat_responses={
+                "<one@example.invalid>": 223,
+            }
+        ) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                nzb_path = tmp / "input.nzb"
+                config_path = tmp / "nntp.ini"
+                nzb_path.write_text(
+                    make_nzb(
+                        """
+                        <nzb>
+                          <file><segments><segment>&lt;one@example.invalid&gt;</segment></segments></file>
+                        </nzb>
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [server.primary]
+                        host = {server.host}
+                        port = {server.port}
+                        ssl = false
+                        max_connections = 1
+                        timeout = 1
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+
+                summary = await asyncio.wait_for(
+                    verify_nzb.verify_nzb(
+                        nzb_path,
+                        config_path,
+                        retries=0,
+                        progress_stream=BrokenProgress(),
+                    ),
+                    timeout=2,
+                )
+
+        assert summary.total_checked == 1
+        assert summary.present == 1
+        assert summary.missing == 0
+        assert summary.error == 0
 
     async def test_shared_queue_keeps_fast_workers_busy(self):
         import verify_nzb

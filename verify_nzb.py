@@ -291,6 +291,7 @@ class _Verifier:
         self._finished = asyncio.Event()
         self._shutdown = False
         self._progress_was_written = False
+        self._progress_failed = False
 
     async def run(self, message_ids: Iterable[str], missing_output: str | Path | None = None) -> VerificationSummary:
         start = time.monotonic()
@@ -475,33 +476,41 @@ class _Verifier:
         else:
             self.error += 1
             self.issues.append((message_id, "error"))
-        self._write_progress(message_id, final_status)
         self._pending_messages -= 1
         self._maybe_finish_locked()
+        self._write_progress(message_id, final_status)
 
     def _write_progress(self, message_id: str, final_status: str) -> None:
+        if self._progress_failed:
+            return
         stream = self.progress_stream
-        stream.write(
-            "\r"
-            f"checked {self.total_checked} total, present={self.present}, missing={self.missing}, "
-            f"error={self.error}, last={message_id} => {final_status}"
-        )
-        flush = getattr(stream, "flush", None)
-        if callable(flush):
-            flush()
-        self._progress_was_written = True
+        try:
+            stream.write(
+                "\r"
+                f"checked {self.total_checked} total, present={self.present}, missing={self.missing}, "
+                f"error={self.error}, last={message_id} => {final_status}"
+            )
+            flush = getattr(stream, "flush", None)
+            if callable(flush):
+                flush()
+            self._progress_was_written = True
+        except OSError:
+            self._progress_failed = True
 
     def _maybe_finish_locked(self) -> None:
         if self._input_complete and self._pending_messages == 0:
             self._finished.set()
 
     def _finish_progress(self) -> None:
-        if not self._progress_was_written:
+        if not self._progress_was_written or self._progress_failed:
             return
-        self.progress_stream.write("\n")
-        flush = getattr(self.progress_stream, "flush", None)
-        if callable(flush):
-            flush()
+        try:
+            self.progress_stream.write("\n")
+            flush = getattr(self.progress_stream, "flush", None)
+            if callable(flush):
+                flush()
+        except OSError:
+            self._progress_failed = True
 
 async def verify_nzb(
     nzb_path: str | Path,
