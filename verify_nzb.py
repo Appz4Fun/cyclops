@@ -227,6 +227,8 @@ class AsyncNntpConnection:
             self._writer.write((command + "\r\n").encode("ascii"))
             await asyncio.wait_for(self._writer.drain(), timeout=self.config.timeout)
             return await self._read_response()
+        except UnicodeEncodeError as exc:
+            raise ProtocolNntpError("NNTP command is not ASCII encodable") from exc
         except asyncio.TimeoutError as exc:
             raise TransientNntpError("command timeout") from exc
         except (ConnectionResetError, BrokenPipeError, OSError, asyncio.IncompleteReadError) as exc:
@@ -350,7 +352,14 @@ class _Verifier:
                 job = await self._take_job(server_index)
                 if job is None:
                     return
-                await self._handle_job(server_index, connection, job.message_id, job.target_server_index)
+                try:
+                    await self._handle_job(server_index, connection, job.message_id, job.target_server_index)
+                except Exception:
+                    async with self.job_condition:
+                        state = self.states.get(job.message_id)
+                        if state is not None:
+                            state.had_error = True
+                            await self._finalize_locked(job.message_id, "error")
         except asyncio.CancelledError:
             raise
 
@@ -383,9 +392,7 @@ class _Verifier:
         async with self.job_condition:
             if state.final_status is not None:
                 return
-            if target_server_index is None:
-                state.next_server_index = server_index
-            elif target_server_index != server_index:
+            if target_server_index is not None and target_server_index != server_index:
                 self._defer_message_locked(message_id, target_server_index)
                 return
             state.tried_servers.add(server_index)
@@ -444,7 +451,6 @@ class _Verifier:
         if state.final_status is not None or state.queued:
             return
         state.queued = True
-        state.next_server_index = server_index
         self.jobs.append(_Job(message_id=message_id, target_server_index=server_index))
         self.job_condition.notify_all()
 

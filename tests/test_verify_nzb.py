@@ -362,6 +362,58 @@ class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
         assert queued is True
         assert verifier._pending_messages == 1
 
+    async def test_non_ascii_message_id_finishes_as_error_without_deadlock(self):
+        import verify_nzb
+
+        async with FakeNntpServer(stat_responses={}) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                nzb_path = tmp / "input.nzb"
+                config_path = tmp / "nntp.ini"
+                missing_output = tmp / "missing.txt"
+                nzb_path.write_text(
+                    make_nzb(
+                        """
+                        <nzb>
+                          <file><segments><segment>snow☃@example.invalid</segment></segments></file>
+                        </nzb>
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [server.primary]
+                        host = {server.host}
+                        port = {server.port}
+                        ssl = false
+                        max_connections = 1
+                        timeout = 1
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+
+                summary = await asyncio.wait_for(
+                    verify_nzb.verify_nzb(
+                        nzb_path,
+                        config_path,
+                        retries=0,
+                        missing_output=missing_output,
+                        progress_stream=io.StringIO(),
+                    ),
+                    timeout=2,
+                )
+
+                output = missing_output.read_text(encoding="utf-8").splitlines()
+
+        assert summary.total_checked == 1
+        assert summary.present == 0
+        assert summary.missing == 0
+        assert summary.error == 1
+        assert output == ["snow☃@example.invalid\terror"]
+
     async def test_progress_output_is_in_place_with_final_newline(self):
         import verify_nzb
 
@@ -477,7 +529,8 @@ class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
 
         assert summary.total_checked == 8
         assert summary.present == 8
-        assert summary.elapsed_seconds < 0.55
+        assert len(slow_server.stat_commands) < 8
+        assert len(fast_server.stat_commands) > len(slow_server.stat_commands)
         assert slow_server.connection_count == 1
         assert fast_server.connection_count == 4
 
