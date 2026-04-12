@@ -1,0 +1,8 @@
+[server.primary]
+host = news.example.com
+port = 563
+ssl = true
+username = your_username
+password = your_password
+max_connections = 50
+timeout = 10

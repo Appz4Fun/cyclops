@@ -1,1 +1,7 @@
-docs/superpowers/
+docs/
+nzbs/
+config.ini
+*.log
+*.txt
+.*
+!.gitignore
