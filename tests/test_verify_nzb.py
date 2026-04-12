@@ -286,6 +286,61 @@ class TestVerifyNzbAsync(unittest.IsolatedAsyncioTestCase):
         assert summary.present == 1
         assert server.stat_commands == ["<bare@example.invalid>"]
 
+    async def test_duplicate_segment_ids_deduplicate_network_checks_without_deadlock(self):
+        import verify_nzb
+
+        async with FakeNntpServer(
+            stat_responses={
+                "<dup@example.invalid>": 223,
+            }
+        ) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                nzb_path = tmp / "input.nzb"
+                config_path = tmp / "nntp.ini"
+                nzb_path.write_text(
+                    make_nzb(
+                        """
+                        <nzb>
+                          <file><segments><segment>&lt;dup@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;dup@example.invalid&gt;</segment></segments></file>
+                          <file><segments><segment>&lt;dup@example.invalid&gt;</segment></segments></file>
+                        </nzb>
+                        """
+                    ),
+                    encoding="utf-8",
+                )
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [server.primary]
+                        host = {server.host}
+                        port = {server.port}
+                        ssl = false
+                        max_connections = 1
+                        timeout = 1
+                        """
+                    ).lstrip(),
+                    encoding="utf-8",
+                )
+
+                progress = io.StringIO()
+                summary = await asyncio.wait_for(
+                    verify_nzb.verify_nzb(
+                        nzb_path,
+                        config_path,
+                        retries=0,
+                        progress_stream=progress,
+                    ),
+                    timeout=2,
+                )
+
+        assert summary.total_checked == 3
+        assert summary.present == 1
+        assert summary.missing == 0
+        assert summary.error == 0
+        assert server.stat_commands == ["<dup@example.invalid>"]
+
     async def test_progress_output_is_in_place_with_final_newline(self):
         import verify_nzb
 
