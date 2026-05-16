@@ -1,5 +1,7 @@
 # nzbcyclops
 
+![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/Appz4Fun/cyclops?utm_source=oss&utm_medium=github&utm_campaign=Appz4Fun%2Fcyclops&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
+
 Fast async NZB verification against one or more NNTP servers.
 
 `nzbcyclops` reads an `.nzb`, extracts every article `Message-ID`, and checks article availability with persistent async NNTP connections. The default path is optimized for speed and low bandwidth: it uses `STAT` only, keeps all configured servers active from the start, and marks an article missing only after every server returns `430`.
