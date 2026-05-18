@@ -115,19 +115,40 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+_YENC_DECODE_TABLE = bytes((i - 42) % 256 for i in range(256))
+_YENC_ESCAPE_DECODE_TABLE = bytes((i - 106) % 256 for i in range(256))
+
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
+    """
+    Optimized yEnc decoding using bytes.translate and split.
+    This avoids slow byte-by-byte loops in Python.
+    """
     decoded = bytearray()
     for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
+        if b"=" not in line:
+            decoded.extend(line.translate(_YENC_DECODE_TABLE))
+            continue
+
+        parts = line.split(b"=")
+        decoded.extend(parts[0].translate(_YENC_DECODE_TABLE))
+
+        i = 1
+        n = len(parts)
+        while i < n:
+            part = parts[i]
+            if not part:
+                if i == n - 1:
                     raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
+                decoded.append(211)  # (61 - 106) % 256
+                i += 1
+                if i < n and parts[i]:
+                    decoded.extend(parts[i].translate(_YENC_DECODE_TABLE))
+            else:
+                decoded.append(_YENC_ESCAPE_DECODE_TABLE[part[0]])
+                if len(part) > 1:
+                    decoded.extend(part[1:].translate(_YENC_DECODE_TABLE))
+            i += 1
     return bytes(decoded)
 
 
