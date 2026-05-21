@@ -115,19 +115,34 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+_YENC_NORMAL_TABLE = bytes((i - 42) % 256 for i in range(256))
+
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
+    """
+    Decodes yEnc lines efficiently by leveraging C-level operations like `bytes.translate`
+    and `bytes.find`. This avoids slow byte-by-byte Python iteration, making it significantly
+    faster for deep-checks.
+    """
     decoded = bytearray()
     for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
+        if b"=" not in line:
+            decoded.extend(line.translate(_YENC_NORMAL_TABLE))
+            continue
+
+        start = 0
+        while True:
+            pos = line.find(b"=", start)
+            if pos == -1:
+                decoded.extend(line[start:].translate(_YENC_NORMAL_TABLE))
+                break
+
+            decoded.extend(line[start:pos].translate(_YENC_NORMAL_TABLE))
+            if pos + 1 >= len(line):
+                raise ValueError("dangling yEnc escape")
+
+            decoded.append((line[pos + 1] - 106) % 256)
+            start = pos + 2
     return bytes(decoded)
 
 
