@@ -115,19 +115,40 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+_YENC_TRANSLATION_TABLE = bytes((i - 42) % 256 for i in range(256))
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
-    decoded = bytearray()
-    for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
+    data = b"".join(lines)
+    if b"=" not in data:
+        return data.translate(_YENC_TRANSLATION_TABLE)
+
+    parts = data.split(b"=")
+
+    decoded = bytearray(parts[0].translate(_YENC_TRANSLATION_TABLE))
+
+    skip = False
+    for i in range(1, len(parts)):
+        if skip:
+            skip = False
+            continue
+
+        part = parts[i]
+        if not part:
+            if i == len(parts) - 1:
+                raise ValueError("dangling yEnc escape")
+            # If the part is empty, it means the escape char was '=' (61).
+            # The decoded byte is (61 - 106) % 256 = 211.
+            decoded.append(211)
+            if i + 1 < len(parts):
+                decoded.extend(parts[i+1].translate(_YENC_TRANSLATION_TABLE))
+            skip = True
+        else:
+            # The first char of the part is the escaped char.
+            # The yEnc decode step is (char - 64 - 42) % 256 = (char - 106) % 256.
+            decoded.append((part[0] - 106) % 256)
+            if len(part) > 1:
+                decoded.extend(part[1:].translate(_YENC_TRANSLATION_TABLE))
+
     return bytes(decoded)
 
 
