@@ -115,19 +115,35 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+_YENC_DECODE_TABLE = bytes((i - 42) % 256 for i in range(256))
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
-    decoded = bytearray()
-    for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
+    # Joining all lines up-front to leverage C-level split and translate
+    data = b"".join(lines)
+    if b"=" not in data:
+        return data.translate(_YENC_DECODE_TABLE)
+
+    parts = data.split(b"=")
+    decoded = bytearray(parts[0].translate(_YENC_DECODE_TABLE))
+
+    i = 1
+    length = len(parts)
+    while i < length:
+        part = parts[i]
+        if not part:
+            if i == length - 1:
+                raise ValueError("dangling yEnc escape")
+            # If part is empty, it means we encountered b"=="
+            decoded.append(211) # (61 - 106) % 256 = 211
+            i += 1
+            part = parts[i]
+            if part:
+                decoded.extend(part.translate(_YENC_DECODE_TABLE))
+        else:
+            decoded.append((part[0] - 106) % 256) # -64 - 42 = -106
+            if len(part) > 1:
+                decoded.extend(part[1:].translate(_YENC_DECODE_TABLE))
+        i += 1
     return bytes(decoded)
 
 
