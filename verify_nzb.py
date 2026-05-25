@@ -91,11 +91,10 @@ def parse_nzb_message_ids(path: str | Path) -> Iterator[str]:
 
     with open(path, "rb") as handle:
         for event, elem in ET.iterparse(handle, events=("end",)):
-            if _local_name(elem.tag) != "segment":
-                continue
-            text = (elem.text or "").strip()
-            if text:
-                yield text
+            if _local_name(elem.tag) == "segment":
+                text = (elem.text or "").strip()
+                if text:
+                    yield text
             elem.clear()
 
 
