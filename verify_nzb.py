@@ -115,19 +115,34 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+_YENC_DECODE_TABLE = bytes((i - 42) % 256 for i in range(256))
+
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
+    # ⚡ Bolt: Using bytes.translate and bytes.find natively in C is significantly faster
+    # than iterating byte-by-byte in pure Python.
     decoded = bytearray()
     for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
+        if b"=" not in line:
+            decoded.extend(line.translate(_YENC_DECODE_TABLE))
+            continue
+
+        idx = 0
+        length = len(line)
+        while idx < length:
+            next_idx = line.find(b"=", idx)
+            if next_idx == -1:
+                decoded.extend(line[idx:].translate(_YENC_DECODE_TABLE))
+                break
+
+            if next_idx > idx:
+                decoded.extend(line[idx:next_idx].translate(_YENC_DECODE_TABLE))
+
+            if next_idx + 1 >= length:
+                raise ValueError("dangling yEnc escape")
+
+            decoded.append((line[next_idx + 1] - 106) % 256)
+            idx = next_idx + 2
     return bytes(decoded)
 
 
