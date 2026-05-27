@@ -80,23 +80,21 @@ class MissingArticleError(NntpError):
     """The NNTP server does not have the requested article."""
 
 
-def _local_name(tag: str) -> str:
-    if "}" in tag:
-        return tag.rsplit("}", 1)[-1]
-    return tag
-
-
 def parse_nzb_message_ids(path: str | Path) -> Iterator[str]:
     """Yield message IDs from <segment> elements in an NZB file."""
 
     with open(path, "rb") as handle:
-        for event, elem in ET.iterparse(handle, events=("end",)):
-            if _local_name(elem.tag) != "segment":
-                continue
-            text = (elem.text or "").strip()
-            if text:
-                yield text
-            elem.clear()
+        context = ET.iterparse(handle, events=("start", "end"))
+        _, root = next(context)
+        for event, elem in context:
+            if event == "end":
+                tag = elem.tag
+                if tag.endswith("}segment") or tag == "segment":
+                    text = (elem.text or "").strip()
+                    if text:
+                        yield text
+                elem.clear()
+                root.clear()
 
 
 def normalize_message_id(message_id: str) -> str:
