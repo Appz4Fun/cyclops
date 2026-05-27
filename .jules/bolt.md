@@ -1,0 +1,3 @@
+## 2026-05-27 - ElementTree.iterparse Memory Leaks and Overhead
+**Learning:** `ElementTree.iterparse` leaks memory if only parsing the `end` events and calling `.clear()` on child elements, as the `root` element retains references to its children until the document finishes parsing. Also, parsing the local XML namespace name using a custom method (like `.rsplit()`) adds up linearly with the size of the XML.
+**Action:** For parsing large XML files using `iterparse`, always fetch the `start` and `end` events, grab the `root` element on the first `start` event, and call both `elem.clear()` and `root.clear()` on the `end` events. Use simple string checks like `tag.endswith("}segment") or tag == "segment"` to save string parsing overhead.
