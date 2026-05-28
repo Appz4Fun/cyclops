@@ -106,6 +106,9 @@ def normalize_message_id(message_id: str) -> str:
     return f"<{text.strip('<>')}>"
 
 
+_YENC_TRANS_TABLE = bytes((i - 42) % 256 for i in range(256))
+
+
 def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     attrs: dict[str, str] = {}
     for token in line.decode("latin-1", errors="replace").split()[1:]:
@@ -116,18 +119,26 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
 
 
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
-    decoded = bytearray()
-    for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
+    """
+    Decode yEnc data lines into bytes.
+    Optimized by joining the lines and using bytes.translate(),
+    which is significantly faster than byte-by-byte iteration.
+    """
+    data = b"".join(lines)
+    parts = data.split(b"=")
+
+    if len(parts) == 1:
+        return data.translate(_YENC_TRANS_TABLE)
+
+    decoded = bytearray(parts[0].translate(_YENC_TRANS_TABLE))
+    for i in range(1, len(parts)):
+        part = parts[i]
+        if not part:
+            raise ValueError("dangling yEnc escape")
+        decoded.append((part[0] - 106) % 256)
+        if len(part) > 1:
+            decoded.extend(part[1:].translate(_YENC_TRANS_TABLE))
+
     return bytes(decoded)
 
 
