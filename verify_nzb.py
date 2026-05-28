@@ -89,14 +89,26 @@ def _local_name(tag: str) -> str:
 def parse_nzb_message_ids(path: str | Path) -> Iterator[str]:
     """Yield message IDs from <segment> elements in an NZB file."""
 
+    # We track start and end events to clear the root element and avoid memory leaks
+    # when processing extremely large NZB files.
     with open(path, "rb") as handle:
-        for event, elem in ET.iterparse(handle, events=("end",)):
-            if _local_name(elem.tag) != "segment":
-                continue
-            text = (elem.text or "").strip()
-            if text:
-                yield text
-            elem.clear()
+        context = ET.iterparse(handle, events=("start", "end"))
+        context = iter(context)
+        try:
+            _, root = next(context)
+        except StopIteration:
+            return
+
+        for event, elem in context:
+            if event == "end":
+                local_name = _local_name(elem.tag)
+                if local_name == "segment":
+                    text = (elem.text or "").strip()
+                    if text:
+                        yield text
+                elem.clear()
+                if local_name == "file":
+                    root.clear()
 
 
 def normalize_message_id(message_id: str) -> str:
