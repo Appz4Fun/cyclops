@@ -115,19 +115,37 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+# Translation tables for yEnc decoding to avoid slow byte-by-byte iteration in Python.
+# Normal bytes are shifted by 42. Escaped bytes are shifted by 42+64=106.
+_YENC_TRANS = bytes((i - 42) % 256 for i in range(256))
+_YENC_ESCAPE_TRANS = bytes((i - 106) % 256 for i in range(256))
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
+    """
+    Decodes yEnc-encoded lines into bytes.
+    Optimized to use C-backed bytes.translate() and bytes.find() instead of manual iteration.
+    """
     decoded = bytearray()
     for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
+        # Fast path: no escapes in the line
+        if b"=" not in line:
+            decoded.extend(line.translate(_YENC_TRANS))
+            continue
+
+        # Slow path: apply escapes manually using string find
+        idx = 0
+        length = len(line)
+        while idx < length:
+            next_eq = line.find(b"=", idx)
+            if next_eq == -1:
+                decoded.extend(line[idx:].translate(_YENC_TRANS))
+                break
+            decoded.extend(line[idx:next_eq].translate(_YENC_TRANS))
+            idx = next_eq + 1
+            if idx >= length:
+                raise ValueError("dangling yEnc escape")
+            decoded.append(_YENC_ESCAPE_TRANS[line[idx]])
+            idx += 1
     return bytes(decoded)
 
 

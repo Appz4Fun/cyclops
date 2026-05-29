@@ -1,0 +1,3 @@
+## 2024-05-29 - yEnc decoding optimization with bytes.find() and bytes.translate()
+**Learning:** Using `bytes.split(b'=')` for yEnc decoding fails when lines contain consecutive escapes (e.g., `==`) due to how splitting creates empty strings and fails to track indices correctly. To optimize Python byte string processing effectively while handling escapes correctly, use `bytes.translate()` for bulk decoding and `bytes.find()` to locate and apply escapes manually.
+**Action:** Prioritize `bytes.translate` and `bytes.find` over `.split` when translating strings with multi-character escape sequences, ensuring correctness on edge cases like consecutive escapes.
