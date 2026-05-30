@@ -106,6 +106,9 @@ def normalize_message_id(message_id: str) -> str:
     return f"<{text.strip('<>')}>"
 
 
+YENC_TRANSLATE_TABLE = bytes((i - 42) % 256 for i in range(256))
+
+
 def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     attrs: dict[str, str] = {}
     for token in line.decode("latin-1", errors="replace").split()[1:]:
@@ -116,19 +119,20 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
 
 
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
+    data = b"".join(lines)
     decoded = bytearray()
-    for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
-    return bytes(decoded)
+    start = 0
+    while True:
+        idx = data.find(b"=", start)
+        if idx == -1:
+            decoded.extend(data[start:])
+            break
+        decoded.extend(data[start:idx])
+        if idx + 1 >= len(data):
+            raise ValueError("dangling yEnc escape")
+        decoded.append((data[idx + 1] - 64) % 256)
+        start = idx + 2
+    return bytes(decoded.translate(YENC_TRANSLATE_TABLE))
 
 
 def validate_yenc_body(lines: Iterable[bytes | str]) -> YencValidationResult:
