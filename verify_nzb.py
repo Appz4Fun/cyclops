@@ -115,20 +115,32 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+_YENC_DECODE_TABLE = bytes((i - 42) % 256 for i in range(256))
+
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
-    decoded = bytearray()
-    for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
-    return bytes(decoded)
+    """
+    Decodes yEnc-encoded lines using C-backed bytes methods for significant performance gain.
+    Expects ~8-10x speedup by avoiding Python byte-by-byte iteration.
+    """
+    data = b"".join(lines)
+    if b"=" not in data:
+        return data.translate(_YENC_DECODE_TABLE)
+
+    chunks = []
+    start = 0
+    while True:
+        idx = data.find(b"=", start)
+        if idx == -1:
+            chunks.append(data[start:].translate(_YENC_DECODE_TABLE))
+            break
+        chunks.append(data[start:idx].translate(_YENC_DECODE_TABLE))
+        if idx + 1 >= len(data):
+            raise ValueError("dangling yEnc escape")
+        escaped_byte = data[idx + 1]
+        chunks.append(bytes([(escaped_byte - 106) % 256]))
+        start = idx + 2
+    return b"".join(chunks)
 
 
 def validate_yenc_body(lines: Iterable[bytes | str]) -> YencValidationResult:
