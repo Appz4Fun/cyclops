@@ -115,20 +115,39 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+_DECODE_TRANSLATION_TABLE = bytes((i - 42) % 256 for i in range(256))
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
-    decoded = bytearray()
-    for line in lines:
-        index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
-    return bytes(decoded)
+    """
+    Decodes yEnc data fast by leveraging C-backed bytes methods.
+    Instead of manual byte-by-byte iteration, we find escape characters
+    using `bytes.find()`, then apply the global `(byte - 42) % 256` shift
+    at the end using `bytes.translate()`.
+    """
+    data = b"".join(lines)
+    if not data:
+        return b""
+
+    out = bytearray()
+    idx = 0
+    length = len(data)
+
+    while True:
+        next_idx = data.find(61, idx)  # 61 is '='
+        if next_idx == -1:
+            out.extend(data[idx:])
+            break
+
+        out.extend(data[idx:next_idx])
+        if next_idx + 1 >= length:
+            raise ValueError("dangling yEnc escape")
+
+        # The escaped byte has a -64 offset in yEnc.
+        # Since we use a translate table later that subtracts 42, we only subtract 64 here.
+        out.append((data[next_idx + 1] - 64) % 256)
+        idx = next_idx + 2
+
+    return bytes(out.translate(_DECODE_TRANSLATION_TABLE))
 
 
 def validate_yenc_body(lines: Iterable[bytes | str]) -> YencValidationResult:
