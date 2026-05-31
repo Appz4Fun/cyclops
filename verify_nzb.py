@@ -115,19 +115,36 @@ def _parse_yenc_attrs(line: bytes) -> dict[str, str]:
     return attrs
 
 
+_YENC_NORMAL = bytes((i - 42) % 256 for i in range(256))
+_YENC_ESCAPED = bytes((i - 106) % 256 for i in range(256))
+
 def _decode_yenc_lines(lines: Iterable[bytes]) -> bytes:
+    # ⚡ Bolt: Fast yEnc decoding using C-backed bytes.translate() and bytes.find()
+    # Reduces manual python loop overhead, significantly speeding up large NNTP bodies.
     decoded = bytearray()
     for line in lines:
+        if b"=" not in line:
+            decoded.extend(line.translate(_YENC_NORMAL))
+            continue
+
         index = 0
-        while index < len(line):
-            byte = line[index]
-            if byte == 61:
-                index += 1
-                if index >= len(line):
-                    raise ValueError("dangling yEnc escape")
-                byte = (line[index] - 64) % 256
-            decoded.append((byte - 42) % 256)
-            index += 1
+        length = len(line)
+        while True:
+            next_eq = line.find(b"=", index)
+            if next_eq == -1:
+                decoded.extend(line[index:].translate(_YENC_NORMAL))
+                break
+
+            if next_eq > index:
+                decoded.extend(line[index:next_eq].translate(_YENC_NORMAL))
+
+            escape_idx = next_eq + 1
+            if escape_idx >= length:
+                raise ValueError("dangling yEnc escape")
+
+            decoded.append(_YENC_ESCAPED[line[escape_idx]])
+            index = escape_idx + 1
+
     return bytes(decoded)
 
 
